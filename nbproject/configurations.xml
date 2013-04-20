@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configurationDescriptor version="84">
+  <logicalFolder name="root" displayName="root" projectFiles="true" kind="ROOT">
+    <df name="dbd" root="/root/dbd">
+      <df name=".tmp_versions">
+        <in>dbd.mod</in>
+      </df>
+      <df name="old">
+        <df name="1">
+        </df>
+        <df name="1">
+        </df>
+        <df name="1">
+        </df>
+        <df name="2">
+        </df>
+        <df name="2">
+        </df>
+        <df name="2">
+        </df>
+        <in>btree.c</in>
+        <in>btree.h</in>
+        <in>cache.c</in>
+        <in>comm.h</in>
+        <in>dbd (copy).c</in>
+        <in>dbd.c</in>
+        <in>dbd_1.c</in>
+        <in>dbd_2.c</in>
+        <in>dbd_3.c</in>
+        <in>list.h</in>
+        <in>server.c</in>
+        <in>server1.c</in>
+        <in>tmp.c</in>
+        <in>uapi.h</in>
+      </df>
+      <in>client.c</in>
+      <in>cs.h</in>
+      <in>dbd.c</in>
+      <in>dbd.mod.c</in>
+      <in>dbd_1.c</in>
+      <in>defs.h</in>
+      <in>gateway.c</in>
+      <in>list.h</in>
+      <in>log.c</in>
+      <in>server.c</in>
+      <in>ucomm.h</in>
+    </df>
+    <logicalFolder name="ExternalFiles"
+                   displayName="Important Files"
+                   projectFiles="false"
+                   kind="IMPORTANT_FILES_FOLDER">
+      <itemPath>Makefile</itemPath>
+    </logicalFolder>
+  </logicalFolder>
+  <sourceFolderFilter>^(nbproject)$</sourceFolderFilter>
+  <sourceRootList>
+    <Elem>/root/dbd</Elem>
+  </sourceRootList>
+  <projectmakefile>Makefile</projectmakefile>
+  <confs>
+    <conf name="Default" type="0">
+      <toolsSet>
+        <remote-sources-mode>LOCAL_SOURCES</remote-sources-mode>
+        <compilerSet>default</compilerSet>
+      </toolsSet>
+      <codeAssistance>
+      </codeAssistance>
+      <makefileType>
+        <makeTool>
+          <buildCommandWorkingDir>.</buildCommandWorkingDir>
+          <buildCommand>${MAKE} -f Makefile</buildCommand>
+          <cleanCommand>${MAKE} -f Makefile clean</cleanCommand>
+          <executablePath></executablePath>
+          <cTool>
+            <incDir>
+              <pElem>/usr/src/kernels/2.6.32-279.22.1.el6.x86_64/include</pElem>
+            </incDir>
+          </cTool>
+        </makeTool>
+      </makefileType>
+      <item path="/root/dbd/dbd.c" ex="false" tool="0" flavor2="0">
+        <cTool>
+          <incDir>
+            <pElem>/usr/src/kernels/2.6.32-279.22.1.el6.x86_64/arch/x86/include</pElem>
+            <pElem>/usr/src/kernels/2.6.32-279.22.1.el6.x86_64/include/linux/autoconf.h</pElem>
+            <pElem>/usr/lib/gcc/x86_64-redhat-linux/4.4.6/include</pElem>
+            <pElem>/usr/src/kernels/2.6.32-279.22.1.el6.x86_64</pElem>
+            <pElem>/usr/src/kernels/2.6.32-279.22.1.el6.x86_64/include</pElem>
+          </incDir>
+          <preprocessorList>
+            <Elem>CONFIG_AS_CFI=1</Elem>
+            <Elem>CONFIG_AS_CFI_SIGNAL_FRAME=1</Elem>
+            <Elem>DEBUG_HASH2=20</Elem>
+            <Elem>DEBUG_HASH=59</Elem>
+            <Elem>KBUILD_BASENAME=KBUILD_STR(dbd)</Elem>
+            <Elem>KBUILD_MODNAME=KBUILD_STR(dbd)</Elem>
+            <Elem>KBUILD_STR(s)=#s</Elem>
+            <Elem>MODULE</Elem>
+            <Elem>__KERNEL__</Elem>
+            <Elem>__SSP__=1</Elem>
+          </preprocessorList>
+        </cTool>
+      </item>
+      <item path="/root/dbd/dbd_1.c" ex="false" tool="0" flavor2="0">
+        <cTool>
+          <incDir>
+            <pElem>/usr/src/kernels/2.6.32-279.22.1.el6.x86_64/arch/x86/include</pElem>
+            <pElem>/usr/src/kernels/2.6.32-279.22.1.el6.x86_64/include/linux/autoconf.h</pElem>
+            <pElem>/usr/lib/gcc/x86_64-redhat-linux/4.4.6/include</pElem>
+            <pElem>/usr/src/kernels/2.6.32-279.22.1.el6.x86_64</pElem>
+            <pElem>/usr/src/kernels/2.6.32-279.22.1.el6.x86_64/include</pElem>
+          </incDir>
+          <preprocessorList>
+            <Elem>CONFIG_AS_CFI=1</Elem>
+            <Elem>CONFIG_AS_CFI_SIGNAL_FRAME=1</Elem>
+            <Elem>DEBUG_HASH2=20</Elem>
+            <Elem>DEBUG_HASH=59</Elem>
+            <Elem>KBUILD_BASENAME=KBUILD_STR(dbd)</Elem>
+            <Elem>KBUILD_MODNAME=KBUILD_STR(dbd)</Elem>
+            <Elem>KBUILD_STR(s)=#s</Elem>
+            <Elem>MODULE</Elem>
+            <Elem>__KERNEL__</Elem>
+            <Elem>__SSP__=1</Elem>
+          </preprocessorList>
+        </cTool>
+      </item>
+      <item path="/root/dbd/old/cache.c" ex="true" tool="0" flavor2="0">
+      </item>
+      <item path="/root/dbd/old/dbd (copy).c" ex="true" tool="0" flavor2="0">
+      </item>
+      <item path="/root/dbd/old/dbd.c" ex="false" tool="0" flavor2="0">
+        <cTool>
+          <incDir>
+            <pElem>/usr/src/kernels/2.6.32-279.22.1.el6.x86_64/arch/x86/include</pElem>
+            <pElem>/usr/src/kernels/2.6.32-279.22.1.el6.x86_64/include/linux/autoconf.h</pElem>
+            <pElem>/usr/lib/gcc/x86_64-redhat-linux/4.4.6/include</pElem>
+            <pElem>/usr/src/kernels/2.6.32-279.22.1.el6.x86_64</pElem>
+            <pElem>/usr/src/kernels/2.6.32-279.22.1.el6.x86_64/include</pElem>
+          </incDir>
+          <preprocessorList>
+            <Elem>CONFIG_AS_CFI=1</Elem>
+            <Elem>CONFIG_AS_CFI_SIGNAL_FRAME=1</Elem>
+            <Elem>DEBUG_HASH2=20</Elem>
+            <Elem>DEBUG_HASH=59</Elem>
+            <Elem>KBUILD_BASENAME=KBUILD_STR(dbd)</Elem>
+            <Elem>KBUILD_MODNAME=KBUILD_STR(dbd)</Elem>
+            <Elem>KBUILD_STR(s)=#s</Elem>
+            <Elem>MODULE</Elem>
+            <Elem>__KERNEL__</Elem>
+            <Elem>__SSP__=1</Elem>
+          </preprocessorList>
+        </cTool>
+      </item>
+      <item path="/root/dbd/old/dbd_1.c" ex="false" tool="0" flavor2="0">
+        <cTool>
+          <incDir>
+            <pElem>/usr/src/kernels/2.6.32-279.22.1.el6.x86_64/arch/x86/include</pElem>
+            <pElem>/usr/src/kernels/2.6.32-279.22.1.el6.x86_64/include/linux/autoconf.h</pElem>
+            <pElem>/usr/lib/gcc/x86_64-redhat-linux/4.4.6/include</pElem>
+            <pElem>/usr/src/kernels/2.6.32-279.22.1.el6.x86_64</pElem>
+            <pElem>/usr/src/kernels/2.6.32-279.22.1.el6.x86_64/include</pElem>
+          </incDir>
+          <preprocessorList>
+            <Elem>CONFIG_AS_CFI=1</Elem>
+            <Elem>CONFIG_AS_CFI_SIGNAL_FRAME=1</Elem>
+            <Elem>DEBUG_HASH2=20</Elem>
+            <Elem>DEBUG_HASH=59</Elem>
+            <Elem>KBUILD_BASENAME=KBUILD_STR(dbd)</Elem>
+            <Elem>KBUILD_MODNAME=KBUILD_STR(dbd)</Elem>
+            <Elem>KBUILD_STR(s)=#s</Elem>
+            <Elem>MODULE</Elem>
+            <Elem>__KERNEL__</Elem>
+            <Elem>__SSP__=1</Elem>
+          </preprocessorList>
+        </cTool>
+      </item>
+      <item path="/root/dbd/old/server1.c" ex="true" tool="0" flavor2="0">
+      </item>
+      <folder path="dbd">
+        <cTool>
+          <incDir>
+            <pElem>/usr/src/kernels/2.6.32-279.22.1.el6.x86_64/include</pElem>
+          </incDir>
+        </cTool>
+      </folder>
+    </conf>
+  </confs>
+</configurationDescriptor>

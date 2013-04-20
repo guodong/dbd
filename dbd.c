@@ -17,8 +17,11 @@
 #include <net/sock.h>
 #include <linux/inet.h>
 #include <linux/socket.h>
+#include <linux/netlink.h>
+#include <linux/skbuff.h>
 
-#include "comm.h"
+#include "defs.h"
+#include "ucomm.h"
 
 #define __GFP_MEMALLOC		0x2000u
 
@@ -35,129 +38,26 @@
 
 struct dbd_device {
     spinlock_t queue_lock;
-    struct list_head sending_list; /* Requests waiting result */
-    struct list_head waiting_list; /* Requests to be sent */
-    wait_queue_head_t send_wq;
-    wait_queue_head_t recv_wq;
+    wait_queue_head_t wq;
     struct gendisk *disk;
 };
 
 static struct dbd_device *dbd;
 
-static struct socket *sk;
-static struct task_struct *send_thread;
-static struct task_struct *recv_thread;
-
 static int major;
 static int exit = 0;
+struct sock *nl_sk = NULL;
 
-struct socket *sock_conn(const char *ip, int port) {
-    struct socket *sock = NULL;
-    struct sockaddr_in dest;
-    memset(&dest, '\0', sizeof (dest));
-    sock_create(PF_INET, SOCK_STREAM, IPPROTO_TCP, &sock);
-    dest.sin_family = AF_INET;
-    dest.sin_addr.s_addr = in_aton(ip);
-    dest.sin_port = htons(port);
-    sock->ops->connect(sock, (struct sockaddr*) &dest, sizeof (struct sockaddr_in), !O_NONBLOCK);
-    return sock;
-}
+int is_create = 0;
+pid_t client_pid;
 
-
-
-static int sock_xmit(int send, void *buf, int size,
-        int msg_flags) {
-    struct socket *sock = sk;
-    int result;
-    struct msghdr msg;
-    struct kvec iov;
-    sigset_t blocked, oldset;
-    //unsigned long pflags = current->flags;
-
-
-
-    /* Allow interception of SIGKILL only
-     * Don't allow other signals to interrupt the transmission */
-    siginitsetinv(&blocked, sigmask(SIGKILL));
-    sigprocmask(SIG_SETMASK, &blocked, &oldset);
-
-    current->flags |= PF_MEMALLOC;
-    do {
-        sock->sk->sk_allocation = GFP_NOIO | __GFP_MEMALLOC;
-        iov.iov_base = buf;
-        iov.iov_len = size;
-        msg.msg_name = NULL;
-        msg.msg_namelen = 0;
-        msg.msg_control = NULL;
-        msg.msg_controllen = 0;
-        msg.msg_flags = msg_flags | MSG_NOSIGNAL;
-
-        if (send) {
-            //struct timer_list ti;
-
-            //			if (nbd->xmit_timeout) {
-            //				init_timer(&ti);
-            //				ti.function = nbd_xmit_timeout;
-            //				ti.data = (unsigned long)current;
-            //				ti.expires = jiffies + nbd->xmit_timeout;
-            //				add_timer(&ti);
-            //			}
-            result = kernel_sendmsg(sock, &msg, &iov, 1, size);
-            //			if (nbd->xmit_timeout)
-            //				del_timer_sync(&ti);
-        } else
-            result = kernel_recvmsg(sock, &msg, &iov, 1, size,
-                msg.msg_flags);
-
-        if (signal_pending(current)) {
-            siginfo_t info;
-            printk(KERN_WARNING "nbd (pid %d: %s) got signal %d\n",
-                    task_pid_nr(current), current->comm,
-                    dequeue_signal_lock(current, &current->blocked, &info));
-            result = -EINTR;
-            //sock_shutdown(nbd, !send);
-            break;
-        }
-
-        if (result <= 0) {
-            if (result == 0)
-                result = -EPIPE; /* short read */
-            break;
-        }
-        size -= result;
-        buf += result;
-    } while (size > 0);
-
-    sigprocmask(SIG_SETMASK, &oldset, NULL);
-    //tsk_restore_flags(current, pflags, PF_MEMALLOC);
-
-    return result;
-}
-
-static inline int sock_send_bvec(struct bio_vec *bvec,
-        int flags) {
-    int result;
-    void *kaddr = kmap(bvec->bv_page);
-    result = sock_xmit(1, kaddr + bvec->bv_offset,
-            bvec->bv_len, flags);
-    kunmap(bvec->bv_page);
-    return result;
-}
-
-static inline int sock_recv_bvec(struct bio_vec *bvec) {
-    int result;
-    void *kaddr = kmap(bvec->bv_page);
-    result = sock_xmit(0, kaddr + bvec->bv_offset, bvec->bv_len,
-            MSG_WAITALL);
-    kunmap(bvec->bv_page);
-    return result;
-}
+struct list_head request_list;
 
 static struct request *find_request(struct request *xreq) {
     struct request *req, *tmp;
     int err;
 
-    list_for_each_entry_safe(req, tmp, &dbd->waiting_list, queuelist) {
+    list_for_each_entry_safe(req, tmp, &request_list, queuelist) {
         if (req != xreq)
             continue;
         list_del_init(&req->queuelist);
@@ -167,67 +67,6 @@ static struct request *find_request(struct request *xreq) {
     err = -ENOENT;
     return ERR_PTR(err);
 }
-
-
-
-static int dbd_send_thread(void *data) {
-    struct request *req;
-    struct dbd_request dbd_rqst;
-    int flags = 0;
-
-    while (!kthread_should_stop()) {
-        wait_event_interruptible(dbd->send_wq, kthread_should_stop() || !list_empty(&dbd->sending_list));
-        if(exit) break;
-        req = list_entry(dbd->sending_list.next, struct request, queuelist);
-        list_del_init(&req->queuelist);
-        dbd_rqst.dbd_cmd = (rq_data_dir(req) == READ) ? DBD_CMD_READ : DBD_CMD_WRITE;
-        dbd_rqst.addr = blk_rq_pos(req)*512;
-        dbd_rqst.size = blk_rq_bytes(req);
-        memcpy(dbd_rqst.handle, &req, sizeof (req));
-        sock_xmit(1, &dbd_rqst, sizeof (dbd_rqst), (dbd_rqst.dbd_cmd == DBD_CMD_WRITE) ? MSG_MORE : 0);
-
-        if (dbd_rqst.dbd_cmd == DBD_CMD_WRITE) {
-            struct req_iterator iter;
-            struct bio_vec *bvec;
-
-            rq_for_each_segment(bvec, req, iter) {
-                flags = 0;
-                if (!rq_iter_last(req, iter))
-                    flags = MSG_MORE;
-                printk("request %p: sending %d bytes data\n", req, bvec->bv_len);
-                sock_send_bvec(bvec, flags);
-            }
-        }
-        list_add_tail(&req->queuelist, &dbd->waiting_list);
-        wake_up(&dbd->recv_wq);
-    }
-    return 0;
-}
-
-static int dbd_recv_thread(void *data) {
-    struct dbd_response dbd_rsps;
-    struct request *req;
-
-    while (!kthread_should_stop()) {
-        wait_event_interruptible(dbd->recv_wq, kthread_should_stop() || !list_empty(&dbd->waiting_list));
-        if(exit) break;
-        sock_xmit(0, &dbd_rsps, sizeof (dbd_rsps), MSG_WAITALL);
-        req = find_request(*(struct request **) dbd_rsps.handle);
-        if (dbd_rsps.dbd_cmd == DBD_CMD_READ) {
-            struct req_iterator iter;
-            struct bio_vec *bvec;
-
-            rq_for_each_segment(bvec, req, iter) {
-                sock_recv_bvec(bvec);
-                printk("request %p: got %d bytes data\n", req, bvec->bv_len);
-            }
-        }
-        list_del_init(&req->queuelist);
-        __blk_end_request_all(req, 0);
-    }
-    return 0;
-}
-
 
 static int dbd_open(struct block_device *bdev, fmode_t mode) {
     return 0;
@@ -256,27 +95,94 @@ static int dbd_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd, 
     return -ENOTTY;
 }
 
-void dbd_req_func(struct request_queue *q) {
-    struct request *req;
-    while ((req = blk_fetch_request(q)) != NULL) {
-        printk("request %p: sending control (%d@%llu,%uB)\n",
-                req,
-                rq_data_dir(req),
-                (unsigned long long) blk_rq_pos(req) << 9,
-                blk_rq_bytes(req));
-        list_add_tail(&req->queuelist, &dbd->sending_list);
-        wake_up(&dbd->send_wq);
+int sendnlmsg(void *message, int length) {
+    struct sk_buff *skb;
+    struct nlmsghdr *nlh;
+    int len = NLMSG_SPACE(length);
+
+    if (!message || !nl_sk) {
+        return -1;
     }
 
+    // Allocate a new sk_buffer   
+    skb = alloc_skb(len, GFP_KERNEL);
+    if (!skb) {
+        printk(KERN_ERR "my_net_link: alloc_skb Error./n");
+        return -1;
+    }
+
+    //Initialize the header of netlink message   
+    nlh = nlmsg_put(skb, 0, 0, 0, length, 0);
+
+    NETLINK_CB(skb).pid = 0; // from kernel   
+    NETLINK_CB(skb).dst_group = 0; // multi cast   
+
+    memcpy(NLMSG_DATA(nlh), message, length);
+    //printk("my_net_link: send message '%s'./n", (char *) NLMSG_DATA(nlh));
+
+    //send message by multi cast   
+    //return netlink_broadcast(nl_sk, skb, 0, 1, GFP_KERNEL);
+    return netlink_unicast(nl_sk, skb, client_pid, 0);
 }
 
-void run_thread(void) {
-    init_waitqueue_head(&dbd->send_wq);
-    init_waitqueue_head(&dbd->recv_wq);
-    send_thread = kthread_create(dbd_send_thread, NULL, "dbd_send");
-    wake_up_process(send_thread);
-    recv_thread = kthread_create(dbd_recv_thread, NULL, "dbd_recv");
-    wake_up_process(recv_thread);
+static inline int sock_recv_bvec(struct bio_vec *bvec, char *buf) {
+    int result = 0;
+    void *kaddr = kmap(bvec->bv_page);
+    memcpy(kaddr + bvec->bv_offset, buf, bvec->bv_len);
+    //    result = sock_xmit(sock, 0, kaddr + bvec->bv_offset, bvec->bv_len,
+    //            MSG_WAITALL);
+    kunmap(bvec->bv_page);
+    return result;
+}
+
+static inline int sock_send_bvec(struct bio_vec *bvec, char *buf) {
+    int result = 0;
+    void *kaddr = kmap(bvec->bv_page);
+    memcpy(buf, kaddr + bvec->bv_offset, bvec->bv_len);
+    //    result = sock_xmit(sock, 1, kaddr + bvec->bv_offset,
+    //            bvec->bv_len, flags);
+    kunmap(bvec->bv_page);
+    return result;
+}
+
+void dbd_req_func(struct request_queue *q) {
+    struct request *req;
+    struct dbd_local_request dbd_rqst;
+
+    while ((req = blk_fetch_request(q)) != NULL) {
+        dbd_rqst.domain = 0;
+        dbd_rqst.cmd = (rq_data_dir(req) == READ) ? DBD_CMD_IO_READ : DBD_CMD_IO_WRITE;
+        dbd_rqst.addr = blk_rq_pos(req)*512;
+        dbd_rqst.size = blk_rq_bytes(req);
+        memcpy(dbd_rqst.handle, &req, sizeof (req));
+        sendnlmsg(&dbd_rqst, sizeof (dbd_rqst));
+
+        if (dbd_rqst.cmd == DBD_CMD_IO_WRITE) {
+            /**
+             * @notice here can not use char buf[dbd_rqst.size], because size is long type not int type
+             */
+            char *buf = vmalloc(dbd_rqst.size);
+            char *p = buf;
+            struct req_iterator iter;
+            struct bio_vec *bv;
+            char *buffer;
+            //
+            printk("\n");
+
+            rq_for_each_segment(bv, req, iter) { /*get each bio from request */
+                buffer = page_address(bv->bv_page) + bv->bv_offset;
+                memcpy(p, buffer, bv->bv_len);
+                p += bv->bv_len;
+            }
+            
+            sendnlmsg(buf, dbd_rqst.size);
+            vfree(buf);
+        }
+        printk("send type %d addr: %ld\n", dbd_rqst.cmd, dbd_rqst.addr);
+        list_add(&req->queuelist, &request_list);
+        //__blk_end_request_all(req, 0);
+    }
+
 }
 
 static struct block_device_operations dbd_fops = {
@@ -285,6 +191,7 @@ static struct block_device_operations dbd_fops = {
     .release = dbd_release,
     .ioctl = dbd_ioctl,
 };
+
 int dbd_create(void) {
     major = register_blkdev(0, "dbd");
     dbd->disk = alloc_disk(4);
@@ -295,7 +202,7 @@ int dbd_create(void) {
     dbd->disk->private_data = dbd;
     dbd->disk->fops = &dbd_fops;
     sprintf(dbd->disk->disk_name, "dbd");
-    set_capacity(dbd->disk, 10240);
+    set_capacity(dbd->disk, 10240 / 5 * 16);
     add_disk(dbd->disk);
     return 0;
 }
@@ -304,28 +211,87 @@ void dbd_remove(char *name) {
     blk_cleanup_queue(dbd->disk->queue);
     del_gendisk(dbd->disk);
     put_disk(dbd->disk);
-    unregister_blkdev(major, "dbd");
+    unregister_blkdev(major, name);
+}
+
+void nl_recv_thread(struct sk_buff *__skb) {
+    struct sk_buff *skb;
+    struct nlmsghdr *nlh;
+    struct dbd_local_msg *msg;
+    struct request *req;
+
+    skb = skb_get(__skb);
+    if (skb->len < NLMSG_SPACE(0)) {
+        goto free;
+    }
+    nlh = (struct nlmsghdr *) skb->data;
+    msg = NLMSG_DATA(nlh);
+
+    switch (msg->type) {
+        case DBD_LOCAL_MSG_REQUEST:
+            switch (msg->request.cmd) {
+                case DBD_CMD_CTRL_CREATE:
+                    client_pid = nlh->nlmsg_pid;
+                    dbd_create();
+                    is_create = 1;
+                    break;
+                default:
+                    break;
+            }
+            break;
+        case DBD_LOCAL_MSG_RESPONSE:
+        {
+            printk("get response\n");
+            req = find_request(*(struct request **) msg->response.handle);
+            if (rq_data_dir(req) == READ) {
+                struct req_iterator iter;
+                struct bio_vec *bvec;
+                char *buf, *p;
+                int s = blk_rq_bytes(req);
+                printk("%d %d\n\n", s, blk_rq_bytes(req));
+                buf = (char*) vmalloc(s);
+                memcpy(buf, NLMSG_DATA(nlh) + sizeof (*msg), s);
+                p = buf;
+
+                //memcpy(req->buffer, buf, s);
+
+                rq_for_each_segment(bvec, req, iter) {
+                    void *kaddr = kmap(bvec->bv_page);
+                    memcpy(kaddr + bvec->bv_offset, p, bvec->bv_len);
+                    //printk("request %p: got %d bytes data\n", req, bvec->bv_len);
+                    kunmap(bvec->bv_page);
+                    p += bvec->bv_len;
+                }
+                vfree(buf);
+                //memcpy(req->buffer, NLMSG_DATA(nlh + nlh->nlmsg_len), blk_rq_bytes(req));
+            }
+            __blk_end_request_all(req, 0);
+            break;
+        }
+        default:
+            break;
+    }
+free:
+    kfree_skb(skb);
 }
 
 static int __init dbd_init(void) {
+    INIT_LIST_HEAD(&request_list);
+    nl_sk = netlink_kernel_create(&init_net, NETLINK_PROTOCAL, 0, nl_recv_thread, NULL, THIS_MODULE);
+    if (!nl_sk) {
+        printk("netlink:can not create");
+    }
     dbd = kcalloc(1, sizeof (*dbd), GFP_KERNEL);
-    INIT_LIST_HEAD(&dbd->sending_list);
-    INIT_LIST_HEAD(&dbd->waiting_list);
-    sk = sock_conn("0.0.0.0", 8888);
-    run_thread();
-    dbd_create();
+    printk("init\n");
+    //dbd_create();
     return 0;
 }
 
 static void __exit dbd_exit(void) {
     exit = 1;
-    dbd_remove("dbd");    
-    kthread_stop(send_thread);    
-    kthread_stop(recv_thread);
-    wake_up(&dbd->send_wq);
-    wake_up(&dbd->recv_wq);
-    sock_release(sk);
+    if (is_create) dbd_remove("dbd");
     kfree(dbd);
+    netlink_kernel_release(nl_sk);
 }
 
 module_init(dbd_init);
