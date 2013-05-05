@@ -202,7 +202,7 @@ int dbd_create(void) {
     dbd->disk->private_data = dbd;
     dbd->disk->fops = &dbd_fops;
     sprintf(dbd->disk->disk_name, "dbd");
-    set_capacity(dbd->disk, 10240 / 5 * 16);
+    set_capacity(dbd->disk, 102400 / 5 * 16);
     add_disk(dbd->disk);
     return 0;
 }

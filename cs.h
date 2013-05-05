@@ -12,9 +12,20 @@
 extern "C" {
 #endif
 
+#include "list.h"
+#include "defs.h"
 
-#define TUPLE_SIZE (64*1024)
-#define UNIT_SIZE (1024*1024*4)
+#define UNIT_SIZE (1024*1024)
+    
+    struct dbd_server{
+        char ip[16];
+        int port;
+        int seq;
+        int mask;
+        struct list_head list_node;
+        int sockfd;
+        pthread_t thread;
+    };
 
     struct dbd_remote_request {
         int domain;
@@ -23,10 +34,15 @@ extern "C" {
         unsigned long addr;
         int size;
         struct list_head list_node;
+        int unit_id;
+        int request_offset;
+        struct dbd_server *server;
     } __attribute__((packed));
 
     struct dbd_remote_response {
         char handle[8];
+        int unit_id;
+        int request_offset;
     } __attribute__((packed));
     
     struct dbd_remote_request_wrapper{

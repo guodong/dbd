@@ -18,13 +18,10 @@
 #include "cs.h"
 #include "old/btree.h"
 
-#define MAX_PAYLOAD 1024  // maximum payload size   
-
 static int sock_fd;
 static struct list_head local_request_list;
 static struct list_head remote_request_wrapper_list;
-
-char bf[1024*1024*16];
+static struct list_head server_list;
 
 void nl_send(void *buf, int length, int flags) {
     struct sockaddr_nl addr;
@@ -113,15 +110,16 @@ static struct dbd_remote_request_wrapper *find_request_wrapper(struct dbd_remote
 }
 
 void *remote_recv_thread(void *data) {
+    struct dbd_server *server = data;
     struct dbd_remote_response rsps;
     while (1) {
-        dbd_gateway_recv(&rsps, sizeof (rsps), 0);
+        dbd_gateway_recv(server, &rsps, sizeof (rsps), 0);
         struct dbd_remote_request_wrapper *wrapper = find_request_wrapper(*(struct dbd_remote_request_wrapper **) rsps.handle);
 
         //here receive readed data
         switch (wrapper->local_request->cmd) {
-            case DBD_CMD_IO_READ:
-                dbd_gateway_recv(wrapper->buf, wrapper->local_request->size, 0);
+            case DBD_CMD_IO_READ: // should be saved in unit cache, then read in cache.
+                dbd_gateway_recv(server, &wrapper->buf[rsps.request_offset*UNIT_SIZE], UNIT_SIZE, 0);
                 break;
             default:
                 break;
@@ -138,14 +136,20 @@ void *remote_recv_thread(void *data) {
             if (wrapper->local_request->cmd == DBD_CMD_IO_READ) {
                 char *s_buf = malloc(sizeof (msg) + wrapper->local_request->size);
                 memcpy(s_buf, &msg, sizeof (msg));
-                memcpy(s_buf + sizeof (msg), wrapper->buf, wrapper->local_request->size);
-                
-                //memcpy(s_buf + sizeof (msg), &bf[wrapper->local_request->addr], wrapper->local_request->size);
-                
+                int offset = wrapper->local_request->addr % UNIT_SIZE;
+                memcpy(s_buf + sizeof (msg), &wrapper->buf[offset], wrapper->local_request->size);
+
+
                 nl_send(s_buf, sizeof (msg) + wrapper->local_request->size, 0);
                 free(s_buf);
             } else {
                 nl_send(&msg, sizeof (msg), 0);
+            }
+            struct dbd_remote_request *rqst, *tmp;
+
+            list_for_each_entry_safe(rqst, tmp, &wrapper->remote_request_list, list_node) {
+                list_del_init(&rqst->list_node);
+                free(rqst);
             }
             free(wrapper->local_request);
             free(wrapper->buf);
@@ -155,35 +159,113 @@ void *remote_recv_thread(void *data) {
     }
 }
 
+struct dbd_server *find_server(int unit_id) {
+    struct dbd_server *serv, *tmp;
+
+    list_for_each_entry_safe(serv, tmp, &server_list, list_node) {
+        if ((unit_id & serv->mask) != serv->seq)
+            continue;
+        return serv;
+    }
+    return (void*) 0;
+}
+
+struct dbd_remote_request_wrapper *make_wrapper(struct dbd_local_request *rqst) {
+    struct dbd_remote_request_wrapper *wrapper = malloc(sizeof (struct dbd_remote_request_wrapper));
+    INIT_LIST_HEAD(&wrapper->remote_request_list);
+    wrapper->local_request = rqst;
+
+    int addr = rqst->addr;
+    int size = rqst->size, count = 0, offset = 0, send_size = 0;
+
+    int unit_id = addr / UNIT_SIZE;
+    send_size = (rqst->size > (UNIT_SIZE - addr % UNIT_SIZE)) ? (UNIT_SIZE - addr % UNIT_SIZE) : rqst->size;
+    while (size > 0) {
+
+        struct dbd_server *server = find_server(unit_id);
+
+        struct dbd_remote_request *remote_rqst = malloc(sizeof (struct dbd_remote_request));
+        INIT_LIST_HEAD(&remote_rqst->list_node);
+
+        list_add(&remote_rqst->list_node, &wrapper->remote_request_list);
+
+        remote_rqst->server = server;
+        remote_rqst->unit_id = unit_id++;
+        remote_rqst->addr = (count == 0) ? (rqst->addr % UNIT_SIZE) : 0;
+        remote_rqst->cmd = rqst->cmd;
+        remote_rqst->size = send_size; //size > UNIT_SIZE ? UNIT_SIZE - remote_rqst->addr : size;
+        remote_rqst->request_offset = offset;
+        memcpy(remote_rqst->handle, &wrapper, sizeof (wrapper));
+
+        size -= send_size;
+        count++;
+        offset += 1;
+        send_size = size > UNIT_SIZE ? UNIT_SIZE : size;
+    }
+
+    wrapper->count = count;
+    wrapper->buf = malloc(count * UNIT_SIZE);
+    return wrapper;
+}
+
 void *local_recv_thread(void *data) {
     while (1) {
         struct dbd_local_request *rqst = malloc(sizeof (struct dbd_local_request));
         nl_recv(rqst, sizeof (*rqst));
-        char msg[100];
-        sprintf(msg, "cmd:%d addr: %ld size: %ld", rqst->cmd, rqst->addr, rqst->size);
-        dbd_log(msg);
-        struct dbd_remote_request_wrapper *wrapper = malloc(sizeof (struct dbd_remote_request_wrapper));
-        INIT_LIST_HEAD(&wrapper->remote_request_list);
+        struct dbd_remote_request_wrapper *wrapper = make_wrapper(rqst); // make a remote request wrapper that contains many request to server
         list_add(&wrapper->list_node, &remote_request_wrapper_list);
-        wrapper->local_request = rqst;
-        wrapper->count = 1;
-        wrapper->buf = malloc(rqst->size);
 
-        struct dbd_remote_request *remote_rqst = malloc(sizeof (struct dbd_remote_request));
-
-        remote_rqst->addr = rqst->addr;
-        remote_rqst->cmd = rqst->cmd;
-        remote_rqst->size = rqst->size;
-        memcpy(remote_rqst->handle, &wrapper, sizeof (wrapper));
-        dbd_gateway_send(remote_rqst, sizeof (*remote_rqst), 0);
-        if (rqst->cmd == DBD_CMD_IO_WRITE) {
-            nl_recv(wrapper->buf, rqst->size);
-            dbd_gateway_send(wrapper->buf, rqst->size, 0);
-            //memcpy(bf + rqst->addr, wrapper->buf, rqst->size);
+        if (DBD_CMD_IO_WRITE == rqst->cmd) {
+            int offset = rqst->addr % UNIT_SIZE;
+            nl_recv(&wrapper->buf[offset], rqst->size);
         }
 
+        struct dbd_remote_request *remote_rqst, *tmp;
+
+        list_for_each_entry_safe(remote_rqst, tmp, &wrapper->remote_request_list, list_node) {
+            dbd_gateway_send(remote_rqst->server, remote_rqst, sizeof (*remote_rqst), 0);
+            if (DBD_CMD_IO_WRITE == rqst->cmd) {
+                dbd_gateway_send(remote_rqst->server, &wrapper->buf[remote_rqst->request_offset * UNIT_SIZE], UNIT_SIZE, 0);
+            }
+        }
 
         // free remote_rqst after receive all response, see remote_recv_thread
+    }
+}
+
+void init_server_list() {
+    INIT_LIST_HEAD(&server_list);
+
+    struct dbd_server *server, *s1 = malloc(sizeof (struct dbd_server));
+    server = s1;
+    memcpy(server->ip, "127.0.0.1", strlen("127.0.0.1"));
+    server->port = 8888;
+    server->seq = 0;
+    server->mask = 0x1;
+    server->sockfd = sock_connect(server);
+    INIT_LIST_HEAD(&server->list_node);
+    list_add(&server->list_node, &server_list);
+    pthread_create(&server->thread, NULL, remote_recv_thread, server);
+
+    struct dbd_server *s2 = malloc(sizeof (struct dbd_server));
+    server = s2;
+    memcpy(server->ip, "127.0.0.1", strlen("127.0.0.1"));
+    server->port = 9999;
+    server->seq = 1;
+    server->mask = 0x1;
+    server->sockfd = sock_connect(server);
+    INIT_LIST_HEAD(&server->list_node);
+    list_add(&server->list_node, &server_list);
+    pthread_create(&server->thread, NULL, remote_recv_thread, server);
+}
+
+void remove_server_list() {
+    struct dbd_server *server, *tmp;
+
+    list_for_each_entry_safe(server, tmp, &server_list, list_node) {
+        list_del(&server->list_node);
+        close(server->sockfd);
+        free(server);
     }
 }
 
@@ -191,7 +273,12 @@ int main(int argc, char* argv[]) {
     struct sockaddr_nl src_addr;
     int retval;
 
+    init_server_list();
+
     INIT_LIST_HEAD(&remote_request_wrapper_list);
+    pthread_t thread;
+    pthread_create(&thread, NULL, local_recv_thread, NULL);
+
     sock_fd = socket(PF_NETLINK, SOCK_RAW, NETLINK_PROTOCAL);
     if (sock_fd == -1) {
         printf("error getting socket: %s", strerror(errno));
@@ -211,15 +298,6 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    pthread_t thread;
-    if (pthread_create(&thread, NULL, local_recv_thread, NULL)) {
-        goto out;
-    }
-    pthread_t thread1;
-    if (pthread_create(&thread1, NULL, remote_recv_thread, NULL)) {
-        goto out;
-    }
-
     struct dbd_local_msg msg;
     memset(&msg, 0, sizeof (msg));
     msg.type = DBD_LOCAL_MSG_REQUEST;
@@ -232,6 +310,8 @@ int main(int argc, char* argv[]) {
 out:
     printf("out\n");
     close(sock_fd);
+
+    remove_server_list();
 
     return 0;
 } 

@@ -74,8 +74,11 @@ int main(int argc, char *argv[]) {
                         memset(&rsps, 0, sizeof(rsps));
                         
                         readit(fd, &rqst, sizeof(rqst));
-                        printf("get bytes %d:type: %d, addr: %d, size: %d\n", sizeof(rqst), rqst.cmd, rqst.addr, rqst.size);
+                        printf("type: %d, addr: %d, size: %d, unitId: %d, off: %d\n", rqst.cmd, rqst.addr, rqst.size, rqst.unit_id, rqst.request_offset);
                         memcpy(rsps.handle, rqst.handle, 8);
+                        rsps.unit_id = rqst.unit_id;
+                        rsps.request_offset = rqst.request_offset;
+                        
                         if(rqst.cmd == DBD_CMD_IO_READ){
                             
 //                            char now_work_file[30];
@@ -86,16 +89,16 @@ int main(int argc, char *argv[]) {
 //                            sprintf(dm,"%d",rqst.domain);
 //                            strcat(now_work_file, dm);
 //                            printf("read file:%s\n", now_work_file);
-                            char buf[rqst.size];
-                            FILE *fp = fopen("dt", "rb+");
+                            char buf[UNIT_SIZE];
+                            FILE *fp = fopen(work_file, "rb+");
                             if(!fp){
                                 perror("open file");
                             }
-                            fseek(fp, rqst.addr, SEEK_SET);
-                            fread(buf, rqst.size, 1, fp);
+                            fseek(fp, UNIT_SIZE*rqst.unit_id / 2, SEEK_SET);
+                            fread(buf, UNIT_SIZE, 1, fp);
                             fclose(fp);
                             writeit(fd, &rsps, sizeof(rsps));
-                            writeit(fd, buf, rqst.size);
+                            writeit(fd, buf, UNIT_SIZE);
                         }else if(rqst.cmd == DBD_CMD_IO_WRITE){
 //                            char now_work_file[30];
 //                            memset(now_work_file, '\0', 30);
@@ -106,11 +109,11 @@ int main(int argc, char *argv[]) {
 //                            strcat(now_work_file, dm);
 //                            printf("write file:%s\n", now_work_file);
                             
-                            char buf[rqst.size];
-                            readit(fd, buf, rqst.size);
-                            FILE *fp = fopen("dt", "rb+");
-                            fseek(fp, rqst.addr, SEEK_SET);
-                            fwrite(buf, rqst.size, 1, fp);
+                            char buf[UNIT_SIZE];
+                            readit(fd, buf, UNIT_SIZE);
+                            FILE *fp = fopen(work_file, "rb+");
+                            fseek(fp, UNIT_SIZE*rqst.unit_id / 2 + rqst.addr, SEEK_SET);
+                            fwrite(&buf[rqst.addr], rqst.size, 1, fp);
                             fclose(fp);
                             writeit(fd, &rsps, sizeof(rsps));
                         }
