@@ -1,0 +1,155 @@
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/ioctl.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdlib.h>
+#include <linux/fs.h>
+#include <pthread.h>
+#include <inttypes.h>
+
+#include "../include/list.h"
+#include "../include/defs.h"
+#include "../include/cs.h"
+
+#define _FILE_OFFSET_BITS 64
+#define _LARGEFILE64_SOURCE
+#define __USE_LARGEFILE64
+
+#define SERVER_NR 1;
+
+void copy_file(char *from, char *to);
+char name[50];
+int os;
+int g_fd;
+
+static void readit(int f, void *buf, size_t len)
+{
+    int res;
+    char *b = buf;
+    printf("need read: %d\n", len);
+    while (len > 0) {
+        res = read(f, b, len);
+	printf("read bytes: %d\n", res);
+        len -= res;
+        b += res;
+    }
+}
+
+static void writeit(int f, void *buf, size_t len)
+{
+    int res;
+    char *b = buf;
+    while (len > 0) {
+        res = write(f, b, len);
+	printf("write bytes: %d\n", res);
+        len -= res;
+        b += res;
+    }
+}
+
+struct dbd_msg *recv_msg(int fd)
+{
+    struct dbd_msg *msg = malloc(sizeof(struct dbd_msg));
+
+    int size = sizeof(struct dbd_msghdr);
+    int _s = 0;
+    int body_size;
+    readit(fd, (char*)msg, sizeof (struct msghdr));
+
+    body_size = msg->head.size;
+    msg->body = malloc(body_size);
+    readit(fd, (char*)msg->body, body_size);
+    return msg;
+}
+
+void clean_msg(struct dbd_msg *msg)
+{
+    free(msg->body);
+    free(msg);
+}
+
+void send_msg(int fd, void *buf, int size, int type){
+    int s = sizeof(struct dbd_msghdr) + size;
+    struct dbd_msghdr *hdr = malloc(s);
+    hdr->type = type;
+    hdr->size = size;
+    memcpy((char*)hdr + sizeof(struct dbd_msghdr), buf, size);
+    writeit(fd, hdr, s);
+}
+
+int main(int argc, char *argv[])
+{
+    int port = atoi(argv[1]);
+    char work_file[50];
+    char work_path[50];
+    strcpy(work_path, argv[2]);
+    fd_set fds, fds_bk;
+    int server_sockfd;
+    int _rt;
+    struct sockaddr_in server_address;
+    server_sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    server_address.sin_family = AF_INET;
+    server_address.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_address.sin_port = htons(port);
+    bind(server_sockfd, (struct sockaddr*) &server_address, sizeof (server_address));
+    listen(server_sockfd, 10);
+
+    FD_ZERO(&fds);
+    FD_SET(server_sockfd, &fds);
+    while (1) {
+        int fd;
+        fds_bk = fds;
+        printf("server waiting\n");
+        _rt = select(FD_SETSIZE, &fds_bk, (fd_set *) 0, (fd_set *) 0, (struct timeval *) 0);
+        for (fd = 0; fd < FD_SETSIZE; fd++) {
+            if (FD_ISSET(fd, &fds_bk)) {
+                if (fd == server_sockfd) {
+                    struct sockaddr_in client_address;
+                    int client_len = sizeof (client_address);
+                    int client_sockfd = accept(server_sockfd, (struct sockaddr *) &client_address, &client_len);
+                    FD_SET(client_sockfd, &fds);
+                    printf("adding client on fd %d\n", client_sockfd);
+                } else {
+                    int nread;
+                    ioctl(fd, FIONREAD, &nread);
+                    if (nread == 0) {
+                        FD_CLR(fd, &fds);
+                        printf("removing client on fd %d\n", fd);
+                        close(fd);
+                    } else {
+		    	printf("recvmsg\n");
+                        struct dbd_msg *msg = recv_msg(fd);
+
+                        struct io_request *rqst = (struct io_request*)msg->body;
+                        printf("type: %d, size: %d, unitId: %d, off: %d\n", rqst->type, rqst->unit_id, rqst->size, rqst->unit_id, rqst->offset);
+                        switch(rqst->type){
+                            case DBD_MSG_READ:{
+                                int s = sizeof(struct io_response) + rqst->size;
+                                struct io_response *rsp = malloc(s);
+                                memcpy(rsp->handle, rqst->handle, sizeof(rqst->handle));
+                                rsp->inner_offset = rqst->inner_offset;
+                                rsp->size = rqst->size;
+                                FILE *fp = fopen(work_path, "rb+");
+                                uint64_t addr = rqst->unit_id * UNIT_SIZE + rqst->offset;
+                                fseek(fp, addr, SEEK_SET);
+                                fread((char*)rsp + sizeof(struct io_response), rqst->size, 1, fp);
+                                fclose(fp);
+
+                                send_msg(fd, rsp, s, DBD_MSG_RESPONSE);
+				free(rsp);
+                            }
+
+                        }
+                        clean_msg(msg);
+
+                        }
+                    }
+                }
+            }
+        }
+
+        return 0;
+    }

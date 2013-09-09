@@ -1,0 +1,569 @@
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/blkdev.h>
+#include <linux/hdreg.h>
+#include <net/sock.h>
+#include <linux/netlink.h>
+#include <linux/skbuff.h>
+#include <linux/wait.h>
+#include <linux/kthread.h>
+#include <linux/mm.h>
+#include <linux/proc_fs.h>
+#include <linux/types.h>
+#include <linux/list.h>
+
+#include <linux/string.h>
+#include <linux/socket.h>
+#include <linux/net.h>
+#include <linux/in.h>
+#include <asm/processor.h>
+#include <asm/uaccess.h>
+
+#include "include/dbd.h"
+#define VBD_SECTORS                 16
+#define VBD_HEADS                       4
+#define VBD_CYLINDERS           256
+
+#define OBJECT_SIZE (1024*1024)
+#define UNIT_SIZE (1024*1024)
+
+struct dbd_server {
+    char ip[16];
+    int port;
+    uint64_t seq;
+    uint64_t mask;
+    struct list_head list_node;
+    struct socket *sock;
+    struct task_struct *recv_thread;
+    wait_queue_head_t waiting_wq;
+    int ref; //the requests number runing on this server
+    int exit;
+};
+
+struct request_wrapper {
+    struct bio *bio;
+    struct list_head requests;
+    int count;
+    char *buf;
+};
+
+static struct sock *nl_sk = NULL;
+pid_t client_pid;
+
+static struct list_head servers;
+
+struct bio_node {
+    struct bio *bio;
+    struct list_head list_node;
+};
+
+static struct list_head devices;
+int sendnlmsg(void *message, int length)
+{
+    struct sk_buff *skb;
+    struct nlmsghdr *nlh;
+    int nllen = NLMSG_SPACE(length);
+
+    skb = alloc_skb(nllen, GFP_KERNEL);
+    if (!skb) {
+        printk(KERN_ERR "my_net_link: alloc_skb Error./n");
+        return -1;
+    }
+
+    nlh = nlmsg_put(skb, 0, 0, 0, length, 0);
+    if(NULL == nlh) printk("no room %d, %d, %d\n", length, length, nllen);
+    NETLINK_CB(skb).pid = 0; // from kernel
+    NETLINK_CB(skb).dst_group = 0; // multi cast
+
+    memcpy(NLMSG_DATA(nlh), (char*)message, length);
+    netlink_unicast(nl_sk, skb, client_pid, 0);
+
+    return 0;
+}
+void bio_data_transfer(struct bio *bio, void *buf)
+{
+    int i;
+    struct bio_vec *bvec;
+    int write = (bio_data_dir(bio) == WRITE);
+    char *p = buf;
+
+    bio_for_each_segment(bvec, bio, i) {
+        char *buffer = __bio_kmap_atomic(bio, i, KM_USER0);
+        int s = bvec->bv_len;
+        if(write) {
+            memcpy(p, buffer, s);//bio_cur_bytes(bio));
+        } else {
+            memcpy(buffer, p, s);//bio_cur_bytes(bio));
+        }
+        p += s;
+        __bio_kunmap_atomic(bio, KM_USER0);
+    }
+}
+
+
+int kclose(struct socket *sock)
+{
+    struct socket *sk;
+    int ret = 0;
+
+    sk = (struct socket *)sock;
+    ret = sk->ops->release(sk);
+
+    if (sk)
+        sock_release(sk);
+
+    return ret;
+}
+
+ssize_t ksend(struct socket *sock, const void *buffer, size_t length, int flags)
+{
+    struct socket *sk;
+    struct msghdr msg;
+    struct iovec iov;
+    int len;
+
+    sk = (struct socket *)sock;
+
+    iov.iov_base = (void *)buffer;
+    iov.iov_len = (__kernel_size_t)length;
+
+    msg.msg_name = NULL;
+    msg.msg_namelen = 0;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = NULL;
+    msg.msg_controllen = 0;
+
+    msg.msg_flags = flags;
+    len = sock_sendmsg(sk, &msg, length);//?
+    return len;//len ?
+}
+
+ssize_t krecv(struct socket *sock, void *buffer, size_t length, int flags)
+{
+    struct socket *sk;
+    struct msghdr msg;
+    struct iovec iov;
+    int ret;
+
+    sk = (struct socket *)sock;
+
+    iov.iov_base = (void *)buffer;
+    iov.iov_len = (__kernel_size_t)length;
+
+    msg.msg_name = NULL;
+    msg.msg_namelen = 0;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = NULL;
+    msg.msg_controllen = 0;
+    ret = sock_recvmsg(sk, &msg, length, flags);
+    return ret;
+
+}
+
+int kconnect(struct socket *sock, struct sockaddr *address, int address_len)
+{
+    struct socket *sk;
+    int ret;
+
+    sk = (struct socket *)sock;
+    ret = sk->ops->connect(sk, address, address_len, 0/*sk->file->f_flags*/);
+
+    return ret;
+}
+struct dbd_server *find_server(uint64_t unit_id)
+{
+    struct dbd_server *srv = NULL, *tmp;
+    list_for_each_entry_safe(srv, tmp, &servers, list_node) {
+        if(((srv->seq & srv->mask) ^ (unit_id & srv->mask)) == 0) {
+            return srv;
+        }
+    }
+    return NULL;
+}
+
+void send_request(struct io_request *rq)
+{
+    int s = sizeof(struct dbd_msghdr) + sizeof(struct io_request);
+    struct dbd_msghdr *hdr = kmalloc(s, GFP_KERNEL);
+    hdr->type = rq->type;
+    hdr->size = sizeof(struct io_request);
+    memcpy((char*)hdr + sizeof(struct dbd_msghdr), rq, sizeof(struct io_request));
+    kfree(hdr);
+}
+
+void send_msg(struct socket *sock, void *buf, int size, int type){
+    int s = sizeof(struct dbd_msghdr) + size;
+    struct dbd_msghdr *hdr = kmalloc(s, GFP_KERNEL);
+    hdr->type = type;
+    hdr->size = size;
+    memcpy((char*)hdr + sizeof(struct dbd_msghdr), buf, size);
+    ksend(sock, (char*)hdr, s, 0);
+    kfree(hdr);
+}
+
+void send_bio_request(struct dbd_device *dbd, struct bio *bio)
+{
+    unsigned long addr = bio->bi_sector << 9;
+    unsigned long size = bio->bi_size;
+    int write = (bio_data_dir(bio) == WRITE);
+
+    if(write) {
+        int s = size, us = 0, i_off = 0;
+        uint64_t unit_id = addr / UNIT_SIZE;
+        int offset = addr % UNIT_SIZE;
+        struct request_wrapper *wrapper = kmalloc(sizeof(struct request_wrapper), GFP_KERNEL);
+	wrapper->bio = bio;
+	wrapper->count = 0;
+	wrapper->buf = NULL;
+        while(s > 0){
+            struct io_request *rq;
+            us = (s>(UNIT_SIZE-offset))?(UNIT_SIZE-offset):s;
+            rq = kmalloc(sizeof(struct io_request) + us, GFP_KERNEL);
+            rq->type = DBD_MSG_WRITE;
+            rq->unit_id = unit_id;
+            rq->server = find_server(unit_id);
+            rq->server->ref++;
+            rq->size = us;
+            rq->inner_offset = i_off;
+
+            memcpy(rq->handle, &wrapper, sizeof(wrapper));
+            bio_data_transfer(bio, (char*)rq + sizeof(struct io_request));
+
+            wrapper->count++;
+
+            send_msg(rq->server->sock, rq, sizeof(struct io_request) + us, DBD_MSG_WRITE);
+            kfree(rq);
+            wake_up(&rq->server->waiting_wq);
+
+            unit_id++;
+            offset = 0;
+            i_off += us;
+            s -= us;
+        }
+    } else {
+        //goto end;
+        int s = size;
+        uint64_t unit_id = addr / UNIT_SIZE;
+        int offset = addr % UNIT_SIZE;
+        struct request_wrapper *wrapper = kmalloc(sizeof(struct request_wrapper), GFP_KERNEL);
+        int us = 0, i_off = 0; //offset int one request per remote request
+        printk("send:: addr:%ld size:%ld\n", addr, size);
+
+        INIT_LIST_HEAD(&wrapper->requests);
+        wrapper->bio = bio;
+        wrapper->count = 0;
+        wrapper->buf = kmalloc(size, GFP_KERNEL);
+        while(s > 0) {
+            struct io_request *rq = kmalloc(sizeof(struct io_request), GFP_KERNEL);
+            us = (s>(UNIT_SIZE-offset))?(UNIT_SIZE-offset):s;
+            INIT_LIST_HEAD(&rq->list_node);
+            rq->unit_id = unit_id;
+            rq->offset = offset;
+            rq->server = find_server(unit_id);
+            rq->server->ref++;
+            rq->type = DBD_MSG_READ;
+            rq->size = us;
+            rq->inner_offset = i_off;
+            i_off += us;
+            memcpy(rq->handle, &wrapper, sizeof(wrapper));
+            //list_add_tail(&rq->list_node, &wrapper->requests);
+            wrapper->count++;
+            send_request(rq);
+            kfree(rq);
+            wake_up(&rq->server->waiting_wq);
+
+            unit_id++;
+            offset = 0;
+            s -= us;
+        }
+    }
+//end:
+    //bio_endio(bio, 0);
+    //printk("type:%d, addr:%ld, size: %ld\n", hdr.type, addr, size);
+}
+
+int dbd_thread(void *data)
+{
+    struct dbd_device *dbd = data;
+    struct bio_node *bn;
+    while(!kthread_should_stop() || !list_empty(&dbd->bio_list)) {
+        struct bio *bio;
+
+        wait_event_interruptible(dbd->waiting_wq, kthread_should_stop() || !list_empty(&dbd->bio_list));
+        if(dbd->exit) break;
+
+        spin_lock_irq(&dbd->queue_lock);
+        bn = list_entry(dbd->bio_list.next, struct bio_node, list_node);
+        list_del_init(&bn->list_node);
+        bio = bn->bio;
+        kfree(bn);
+        spin_unlock_irq(&dbd->queue_lock);
+        send_bio_request(dbd, bio);
+        //bio_endio(bio, 0);
+    }
+    printk("dbd_thread end\n");
+    return 0;
+}
+
+static int dbd_open(struct block_device *bdev, fmode_t mode)
+{
+    return 0;
+}
+
+static int dbd_release(struct gendisk *gd, fmode_t mode)
+{
+    return 0;
+}
+
+static int dbd_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd, unsigned long arg)
+{
+    int err;
+    struct hd_geometry geo;
+    switch (cmd) {
+    case HDIO_GETGEO:
+        err = !access_ok(VERIFY_WRITE, arg, sizeof (geo));
+        if (err) return -EFAULT;
+
+        geo.cylinders = VBD_CYLINDERS;
+        geo.heads = VBD_HEADS;
+        geo.sectors = VBD_SECTORS;
+        geo.start = get_start_sect(bdev);
+        if (copy_to_user((void*) arg, &geo, sizeof (geo)))
+            return -EFAULT;
+        return 0;
+    }
+    return -ENOTTY;
+}
+
+static struct block_device_operations dbd_fops = {
+    .owner = THIS_MODULE,
+    .open = dbd_open,
+    .release = dbd_release,
+    .ioctl = dbd_ioctl,
+};
+
+
+static int dbd_make_request(struct request_queue *q, struct bio *bio)
+{
+    struct dbd_device *dbd = q->queuedata;
+
+    struct bio_node *node = kmalloc(sizeof(struct bio_node), GFP_KERNEL);
+    INIT_LIST_HEAD(&node->list_node);
+    node->bio = bio;
+    spin_lock_irq(&dbd->queue_lock);
+    list_add_tail(&node->list_node, &dbd->bio_list);
+    spin_unlock_irq(&dbd->queue_lock);
+    wake_up(&dbd->waiting_wq);
+    //send_bio_request(dbd, bio);
+    //bio_endio(bio, 0);
+    return 0;
+}
+
+void dbd_create(struct dbd_meta *meta)
+{
+    struct dbd_device *dbd = kcalloc(1, sizeof(*dbd), GFP_KERNEL);
+    INIT_LIST_HEAD(&dbd->list_node);
+    INIT_LIST_HEAD(&dbd->bio_list);
+    init_waitqueue_head(&dbd->waiting_wq);
+    dbd->exit = 0;
+
+    dbd->thread = kthread_create(dbd_thread, dbd, "ggg");
+    wake_up_process(dbd->thread);
+    list_add_tail(&dbd->list_node, &devices);
+    strcpy(dbd->name, meta->name);
+    dbd->major = register_blkdev(0, meta->name);
+    spin_lock_init(&dbd->lock);
+    spin_lock_init(&dbd->queue_lock);
+
+    dbd->disk = alloc_disk(4);
+    dbd->queue = blk_alloc_queue(GFP_KERNEL);
+    blk_queue_make_request(dbd->queue, dbd_make_request);
+    blk_queue_logical_block_size(dbd->queue, 512);
+    dbd->queue->queuedata = dbd;
+
+    dbd->disk->major = dbd->major;
+    dbd->disk->first_minor = 1;
+    dbd->disk->private_data = dbd;
+    dbd->disk->fops = &dbd_fops;
+    dbd->disk->queue = dbd->queue;
+    sprintf(dbd->disk->disk_name, meta->name);
+    set_capacity(dbd->disk, (meta->size << 11));
+    add_disk(dbd->disk);
+}
+
+int dbd_remove(char *name)
+{
+    int has = 0;
+    struct dbd_device *dbd = NULL, *_dbd, *tmp;
+    list_for_each_entry_safe(_dbd, tmp, &devices, list_node) {
+        if(0 == strcmp(name, _dbd->name)) {
+            has = 1;
+            dbd = _dbd;
+            break;
+        }
+    }
+    if(!has) {
+        return 1;
+    }
+    blk_cleanup_queue(dbd->disk->queue);
+    del_gendisk(dbd->disk);
+    put_disk(dbd->disk);
+    unregister_blkdev(dbd->major, dbd->name);
+    list_del_init(&dbd->list_node);
+    kfree(dbd);
+    return 0;
+}
+
+void dbd_remove_all(void)
+{
+    struct dbd_device *dbd, *tmp;
+
+    list_for_each_entry_safe(dbd, tmp, &devices, list_node) {
+
+        blk_cleanup_queue(dbd->disk->queue);
+        del_gendisk(dbd->disk);
+        put_disk(dbd->disk);
+        unregister_blkdev(dbd->major, dbd->name);
+        list_del_init(&dbd->list_node);
+        kfree(dbd);
+    }
+}
+
+struct dbd_msg *recv_msg(struct socket *sock)
+{
+    struct dbd_msg *msg = kmalloc(sizeof(struct dbd_msg), GFP_KERNEL);
+
+    int size = sizeof(struct dbd_msghdr);
+    int _s = 0;
+    int ret = 0, body_size;
+    while(size > _s) {
+        ret = krecv(sock, (char*)(&msg->head) + _s, size - _s, 0);
+        _s += ret;
+    }
+
+    _s = 0;
+    body_size = msg->head.size;
+    msg->body = kmalloc(body_size, GFP_KERNEL);
+    while(body_size > _s) {
+        ret = krecv(sock, msg->body + _s, body_size - _s, 0);
+        _s += ret;
+    }
+    return msg;
+}
+
+void clean_msg(struct dbd_msg *msg)
+{
+    kfree(msg->body);
+    kfree(msg);
+}
+
+int remote_recv_thread(void *data)
+{
+    struct dbd_server *server = data;
+    struct dbd_msg *msg;
+    while(!kthread_should_stop() || server->ref > 0) {
+        wait_event_interruptible(server->waiting_wq, kthread_should_stop() || server->ref > 0);
+        if(server->exit) break;
+
+        msg = recv_msg(server->sock);
+        server->ref--;
+        switch(msg->head.type) {
+        case DBD_MSG_RESPONSE: {
+            struct io_response *rsp = (struct io_response*)msg->body;
+            struct request_wrapper *wrapper = *(struct request_wrapper **) rsp->handle;
+            wrapper->count--;
+            if(bio_data_dir(wrapper->bio) == READ) 
+	    	memcpy(wrapper->buf, (char*)rsp + sizeof(struct io_response), rsp->size);
+            if(wrapper->count == 0) {
+                if(bio_data_dir(wrapper->bio) == WRITE) {
+                    bio_endio(wrapper->bio, 0);
+                } else {
+                    bio_data_transfer(wrapper->bio, wrapper->buf);
+                    bio_endio(wrapper->bio, 0);
+                }
+                kfree(wrapper->buf);
+                kfree(wrapper);
+            }
+
+        }
+        default:
+            break;
+        }
+        clean_msg(msg);
+    }
+
+    return 0;
+}
+
+int add_server(char *ip, int port, uint64_t seq, uint64_t mask)
+{
+    struct sockaddr_in addr_srv;
+    int addr_len;
+    struct dbd_server *srv = kmalloc(sizeof(struct dbd_server), GFP_KERNEL);
+    strcpy(srv->ip, ip);
+    srv->port = port;
+    srv->seq = seq;
+    srv->mask = mask;
+    memset(&addr_srv, 0, sizeof(addr_srv));
+    addr_srv.sin_family = AF_INET;
+    addr_srv.sin_port = htons(port);
+    addr_srv.sin_addr.s_addr = in_aton(ip);
+    addr_len = sizeof(struct sockaddr_in);
+    sock_create(AF_INET, SOCK_STREAM, 0, &srv->sock);
+    if (srv->sock == NULL) {
+        printk("socket failed\n");
+        return -1;
+    }
+    if (srv->sock->ops->connect(srv->sock, (struct sockaddr*)&addr_srv, addr_len, 0) < 0) {
+        printk("connect failed\n");
+        return -1;
+    }
+    srv->ref = 0;
+    srv->exit = 0;
+    init_waitqueue_head(&srv->waiting_wq);
+    srv->recv_thread = kthread_create(remote_recv_thread, srv, "recv_thread");
+    wake_up_process(srv->recv_thread);
+    list_add_tail(&srv->list_node, &servers);
+    return 0;
+}
+
+void remove_servers(void)
+{
+    struct dbd_server *srv, *tmp;
+
+    list_for_each_entry_safe(srv, tmp, &servers, list_node) {
+        list_del_init(&srv->list_node);
+        srv->exit = 1;
+        wake_up(&srv->waiting_wq);
+        kclose(srv->sock);
+        kfree(srv);
+    }
+}
+
+static int __init dbd_init(void)
+{
+    struct dbd_meta dbd;
+    char *name = "mydbd";
+    INIT_LIST_HEAD(&devices);
+    INIT_LIST_HEAD(&servers);
+    strcpy(dbd.name, name);
+    dbd.size = 10;
+    add_server("127.0.0.1", 8765, 0, 0);
+    dbd_create(&dbd);
+    //test_sock();
+    return 0;
+}
+
+static void __exit dbd_exit(void)
+{
+    dbd_remove_all();
+    remove_servers();
+}
+
+module_init(dbd_init);
+module_exit(dbd_exit);
+MODULE_LICENSE("GPL");
+
